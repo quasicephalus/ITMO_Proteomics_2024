@@ -1,0 +1,221 @@
+---
+title: "Proteomics HW"
+author: "Lavrentii Danilov"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(readxl)
+library(limma)
+library(ape)
+library(dendextend)
+library(RColorBrewer)
+library(pvclust)
+library(gplots)
+library(NMF)
+library(vegan)
+library(Biobase)
+library(DT)
+library(ggplot2)
+library(impute)
+library(ggrepel)
+library(dplyr)
+library(tidyverse)
+library(psych)
+library(DOSE)
+```
+
+# Data loading & basic preprocessing
+
+```{r}
+prots <- read.csv('peaks_data.csv') 
+
+prots[prots == 'nan' | prots == 'NaN' | prots == ''] <-  NA
+
+prots <- prots %>% 
+  filter(!is.na(Accession) & !is.na(Gene_id)) %>% 
+  select(-`Description...`, -Accession) %>% 
+  distinct(Gene_id, .keep_all = TRUE) %>% #remove some duplicated rows)
+  column_to_rownames(var='Gene_id') %>% 
+  filter(rowSums(!is.na(.)) >= ncol(.)/2) # filter out all rows with more then half NAs
+```
+
+# Imputation with Kmeans
+
+```{r}
+knn_prots <- impute.knn(prots %>% 
+                          as.matrix() %>%
+                          t(), k = 5)$data %>%
+  t() %>% 
+  as.data.frame()
+```
+
+```{r}
+cols <- ifelse(str_detect(colnames(prots), 'BT'), 'red', 'blue')
+boxplot(knn_prots, outline = FALSE, main = "Initial data", col = cols, las=2)
+```
+
+# Normalization and transformation
+
+
+```{r}
+prots_log <- log2(knn_prots+1)
+prots_norm <- normalizeQuantiles(as.matrix(prots_log))
+boxplot(prots_norm, outline = FALSE, main = "Transformed and normalized", col = cols, las=2)
+```
+
+# PCA analysis
+
+```{r}
+prots_pca <-  pca(prots_norm %>% t(), nfactors = 2)$scores %>% as.data.frame()
+prots_pca$state <-  ifelse(str_detect(rownames(prots_pca), 'BT'), 'BT', 'CJK')
+```
+
+```{r}
+ggplot(prots_pca, aes(x=RC1,y=RC2, col=state))+
+  geom_point(size=3)+
+  theme_bw()
+```
+
+There is some batch effect in CJK samples, but differences between batches are far less than differences between states, so it should not severely affect further analysis.
+
+# MA-plot
+
+```{r}
+maplot <- function(X1, X2, pch = 21, main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", lpars = list(col = "blue", lwd = 2), ...){
+  # Координаты
+  X <- (rowMeans(X2) + rowMeans(X1)) / 2
+  Y <- rowMeans(X2) - rowMeans(X1)
+  # График
+  scatter.smooth(x = X, y = Y, main = main, pch = pch, xlab = xlab, ylab = ylab, lpars = lpars, ...)
+  abline(h = c(-1, 0, 1), lty = c(2, 1, 2))
+}
+
+```
+
+```{r}
+prots_norm <- as.data.frame(prots_norm)
+
+maplot(prots_norm %>% select(starts_with('BT')),
+      prots_norm %>% select(starts_with('CJK')))
+```
+
+# Differential expression
+
+```{r}
+expr <- prots_norm %>% as.matrix()
+
+pheno <- data.frame(row.names = colnames(prots_norm),
+                    state = ifelse(str_detect(colnames(prots_norm), 'BT'), 'BT', 'CJK'))
+
+pheno_metadata <- data.frame(
+  labelDescription = c("Experimental condition"),
+  row.names=c("Condition"))
+
+pheno <- new("AnnotatedDataFrame",
+                 data = pheno,
+                 varMetadata = pheno_metadata)
+
+exp_set <-  ExpressionSet(assayData = expr, phenoData = pheno)
+```
+
+```{r}
+X <- model.matrix(~ state, pData(exp_set))
+fit <- lmFit(exp_set, design = X, method = "robust", maxit = 1000)
+efit <- eBayes(fit)
+```
+
+```{r}
+limma_res <- topTable(efit, coef = 2, n = nrow(efit$t))
+
+```
+
+```{r}
+library(EnhancedVolcano)
+EnhancedVolcano(limma_res %>% na.omit(),
+  lab = rownames(limma_res%>% na.omit()),
+  x = 'logFC',
+  y = 'adj.P.Val',
+  title = 'WT versus CJK',
+  pCutoff = 0.05,
+  FCcutoff = 2,
+  pointSize = 2,
+  labSize = 3,  
+  titleLabSize = 9,
+  subtitleLabSize = 9,
+  captionLabSize = 14,
+  legendLabSize = 14,
+  legendIconSize = 4,
+  axisLabSize = 10)
+```
+
+# Enrichment analysis
+
+The most meaningful results are achieved when logFC threshold is more strict, because closer it to 0, the more identical are up and down regulated terms.
+
+```{r}
+sig <- subset(limma_res, adj.P.Val < 0.05)
+up <- subset(sig, logFC > 3)
+down <- subset(sig, logFC < -2)
+```
+
+## Up-regulated proteins
+
+```{r warning=FALSE, message=FALSE}
+library(gprofiler2)
+
+up_names <- gconvert(row.names(up))
+down_names <- gconvert(row.names(down))
+multi_gp_up_reg <- gost(list("up-regulated" = up_names$name), multi_query = FALSE, evcodes =TRUE)
+gp_mod_up = multi_gp_up_reg$result[, c("query", "source", "term_id","term_name", "p_value", "query_size", "intersection_size", "term_size", "effective_domain_size", "intersection")]
+gp_mod_up <- gp_mod_up[order(gp_mod_up$p_value), ]
+gp_mod_up_BP <- gp_mod_up[gp_mod_up$source == "GO:BP", ]
+gp_mod_up_BP$GeneRatio <- paste0(gp_mod_up_BP$intersection_size,  "/", gp_mod_up_BP$query_size)
+gp_mod_up_BP$BgRatio <- paste0(gp_mod_up_BP$term_size, "/", gp_mod_up_BP$effective_domain_size)
+names(gp_mod_up_BP) <- c("Cluster", "Category", "ID", "Description", "p.adjust", "query_size", "Count", "term_size", "effective_domain_size", "geneID", "GeneRatio", "BgRatio")
+gp_mod_up_BP$geneID <- gsub(",", "/", gp_mod_up_BP$geneID)
+row.names(gp_mod_up_BP) <- gp_mod_up_BP$ID
+gp_mod_enrich_up_BP <- new("enrichResult", result = gp_mod_up_BP)
+```
+
+Draw enrichment plot:
+
+```{r warning=FALSE, message=FALSE}
+enrichplot::dotplot(gp_mod_enrich_up_BP, showCategory = 10) + ggplot2::labs(title = "up-regulated") + ggplot2::scale_color_gradient(low = "lightseagreen", high = "darkorange1")
+```
+
+## Down-regulated proteins
+
+```{r warning=FALSE, message=FALSE}
+multi_gp_down_reg <- gost(list("down-regulated" = down_names$name), multi_query = FALSE, evcodes =TRUE)
+
+gp_mod_down = multi_gp_down_reg$result[, c("query", "source", "term_id","term_name", "p_value", "query_size", "intersection_size", "term_size", "effective_domain_size", "intersection")]
+gp_mod_down <- gp_mod_down[order(gp_mod_down$p_value), ]
+
+gp_mod_down_BP <- gp_mod_down[gp_mod_down$source == "GO:BP", ]
+gp_mod_down_BP$GeneRatio <- paste0(gp_mod_down_BP$intersection_size,  "/", gp_mod_down_BP$query_size)
+gp_mod_down_BP$BgRatio <-  paste0(gp_mod_down_BP$term_size, "/", gp_mod_down_BP$effective_domain_size)
+names(gp_mod_down_BP) <- c("Cluster", "Category", "ID", "Description", "p.adjust", "query_size", "Count", "term_size", "effective_domain_size", "geneID", "GeneRatio", "BgRatio")
+gp_mod_down_BP$geneID <- gsub(",", "/", gp_mod_down_BP$geneID)
+gp_mod_enrich_down_BP <- new("enrichResult", result = gp_mod_down_BP)
+```
+
+Draw enrichment plot:
+
+```{r warning=FALSE, message=FALSE}
+enrichplot::dotplot(gp_mod_enrich_down_BP, showCategory = 10) + ggplot2::labs(title = "down-regulated") + ggplot2::scale_color_gradient(low = "lightseagreen", high = "darkorange1")
+```
+
+# Conclusion
+
+The first thing to notice is that in both up- and down-regulated GO:BP terms a large proportion is linked to a localization processes. For example, "cellular localization" term is present in both groups of terms, which may be interpreted as an overall alteration of localization process in the cell, as this is a broad biological process. 
+
+Up-regulated "membrane localization" and "membrane fusion" and "negative regulation of extracellular matrix disassembly" may reflect the fact that CJK cells have rebuilt their expression pattern to produce a large amount of cellular matrix proteins such as collagen, which also assumes membranous localization of proteins. 
+
+On the other hand, "organelle localization", "organic substance transport", "intracellular transport" are down-regulated in CJK cells, which leads to the conclusion that normal cellular processes of maintaning organelles such as Golgi apparatus, intracellular transport of proteins and other molecules, are disrupted in these cells. This may occur because of the physical changes in vell ctructure, that makes impossible to maintain transport processes and cell structure of a normal cell. Large amount of hardened extracellular matrix can also lead to malfunction of intracellular transport mechanism, as cell surface is altered on a physical level. 
+
+Heart valve cells aquire new abnormal functions of extensive formation of extracellular matrix, which is reflected in deifferential expression and can explain functional changes underlying heart calve calcification process.
